@@ -84,7 +84,11 @@ bot ever logs `INSUFFICIENT FUNDS to challenge`, treat it as an incident.
 ## Docker
 
 ```bash
+# Build locally
 docker build -t vea-challenger .
+
+# Or pull the pre-built image from GitHub Container Registry
+docker pull ghcr.io/kleros/vea-validator3:latest
 
 # state (SQLite db) persists under ./data on the host, mapped to /data in the container
 # the container runs as uid 1000, so the host dir must be writable by that uid
@@ -100,6 +104,14 @@ docker run --rm --env-file .env -v "$(pwd)/data:/data" vea-challenger status
 docker run --rm --env-file .env -v "$(pwd)/data:/data" vea-challenger scan
 docker run --rm --env-file .env -v "$(pwd)/data:/data" vea-challenger challenge --epoch 246810
 ```
+
+Or use docker-compose:
+
+```bash
+docker compose up -d
+```
+
+See [`docker-compose.yml`](docker-compose.yml) for the pre-configured setup pointing to `ghcr.io/kleros/vea-validator3`.
 
 `VEA_DB_PATH` defaults to `/data/vea-challenger.db` in the image. For a custom
 route (`VEA_ROUTE_FILE`), also mount the TOML file under `/data` and point the
