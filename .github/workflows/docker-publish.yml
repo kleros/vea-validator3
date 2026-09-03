@@ -20,20 +20,19 @@ jobs:
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ${{ github.registry }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ${{ github.registry }}/${{ github.repository }}
+          images: ghcr.io/${{ github.repository }}
           labels: |
             org.opencontainers.image.title=vea-challenger
             org.opencontainers.image.description=Independent challenger bot for the Vea optimistic bridge
             org.opencontainers.image.source=https://github.com/kleros/vea-validator3
             org.opencontainers.image.license=MIT
-            org.opencontainers.image.revision=${{ steps.vars.outputs.short_sha }}
           tags: |
             type=raw,value=latest
             type=semver,pattern={{version}}
