@@ -1,0 +1,19 @@
+# vea-challenger docker-compose
+# Usage: docker compose up -d
+# The image is pulled from GitHub Container Registry:
+#   ghcr.io/kleros/vea-validator3:latest
+# or a specific version tag:
+#   ghcr.io/kleros/vea-validator3:v0.1.0
+# or a specific commit sha:
+#   ghcr.io/kleros/vea-validator3:sha-abc123
+
+services:
+  vea-challenger:
+    # For production is prefered to use a specific tag/sha version instead of latest
+    image: ghcr.io/kleros/vea-validator3:latest
+    container_name: vea-challenger
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
