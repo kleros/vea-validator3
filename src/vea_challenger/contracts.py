@@ -8,17 +8,24 @@ challenger and resolver need. Verdict-critical inbox reads go through
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
 from web3 import Web3
 
 from . import abi
-from .chain import FINALIZED, LATEST, ChainClient
+from .chain import FINALIZED, LATEST, ChainClient, redact
 from .claims import Claim
 from .config import RouteCfg
+from .verdict import ProviderRoot
 
 log = logging.getLogger(__name__)
+
+# A provider this many blocks behind the highest one is named in a warning.
+PIN_SPREAD_WARN = 64
+# The spread warning for one provider is logged at most this often.
+PIN_SPREAD_LOG_INTERVAL = 3_600
 
 
 @dataclass(frozen=True)
@@ -35,6 +42,32 @@ class L2View:
 
     timestamp: int
     number: int
+
+
+@dataclass(frozen=True)
+class QuorumRead:
+    """snapshots(epoch) as every configured inbox RPC answered it at one tag."""
+
+    root: bytes | None  # the agreed root; None when the answers disagree (split)
+    view: L2View  # the block the answers were read at
+    reads: tuple[ProviderRoot, ...]  # each answering provider's root
+    missing: tuple[str, ...]  # labels of providers that did not answer
+
+    @property
+    def answered(self) -> int:
+        return len(self.reads)
+
+    @property
+    def total(self) -> int:
+        return len(self.reads) + len(self.missing)
+
+    @property
+    def complete(self) -> bool:
+        return not self.missing
+
+    @property
+    def split(self) -> bool:
+        return len({r.root for r in self.reads}) > 1
 
 
 class OutboxContract:
@@ -75,10 +108,20 @@ class OutboxContract:
             )
         )
 
-    def claim_hash(self, epoch: int) -> bytes:
+    def claim_hash(self, epoch: int, block: int | None = None) -> bytes:
+        """claimHashes(epoch) at `latest`, or at `block` when given. A provider
+        that cannot serve that block fails over rather than answering stale."""
+        if block is None:
+            return bytes(
+                self.client.with_failover(
+                    lambda w3: self._c(w3).functions.claimHashes(epoch).call()
+                )
+            )
         return bytes(
             self.client.with_failover(
-                lambda w3: self._c(w3).functions.claimHashes(epoch).call()
+                lambda w3: self._c(w3)
+                .functions.claimHashes(epoch)
+                .call(block_identifier=block)
             )
         )
 
@@ -87,6 +130,15 @@ class OutboxContract:
             self.client.with_failover(
                 lambda w3: self._c(w3).functions.latestVerifiedEpoch().call()
             )
+        )
+
+    def upstream_address(self) -> str:
+        """The outbox's immutable pairing: veaInboxArbToEth, or routerArbToGnosis."""
+        name = (
+            "routerArbToGnosis" if self.route.kind == "arb_to_gnosis" else "veaInboxArbToEth"
+        )
+        return self.client.with_failover(
+            lambda w3: self._c(w3).functions[name]().call()
         )
 
     def hash_claim_onchain(self, claim: Claim) -> bytes:
@@ -156,45 +208,123 @@ class InboxContract:
         self.client = client
         self.route = route
         self.address = Web3.to_checksum_address(route.inbox_address)
+        self._spread_logged: dict[str, float] = {}  # label -> last warning time
 
     def _contract(self, w3: Web3):
         return w3.eth.contract(address=self.address, abi=abi.INBOX_ABI)
 
-    def snapshot_quorum(self, epoch: int, tag: str) -> tuple[bytes, L2View, bool]:
-        """(snapshots(epoch), block view, complete) at `tag`.
+    def snapshot_quorum(self, epoch: int, tag: str) -> QuorumRead:
+        """snapshots(epoch) at `tag` from every configured RPC.
 
-        Every *reachable* RPC must agree on the snapshot value; ``complete`` is
-        True only when every *configured* RPC answered. The irreversible HONEST
-        verdict requires ``complete`` (N-of-N), so a single lying RPC cannot
-        hide a fraud by making its peers unreachable. The block is pinned by
-        number per provider; the returned view is the minimum timestamp across
-        providers (conservative for "has the epoch ended" checks).
+        Never raises on disagreement: a split is returned with ``root=None`` and
+        each provider's answer in ``reads``, so the caller can alert and the
+        deadline rule can use per-provider reads. Raises RuntimeError only when
+        no provider answered. Every provider is read at one pinned block: the
+        lowest tag block among those that answered (minus the inbox chain's
+        confirmations for ``latest``); ``view`` is that block.
         """
 
-        def _read(w3: Web3) -> tuple[bytes, int, int]:
-            block = w3.eth.get_block(tag)
-            root = self._contract(w3).functions.snapshots(epoch).call(
-                block_identifier=block["number"]
-            )
-            return (bytes(root), int(block["timestamp"]), int(block["number"]))
+        client = self.client
+        w3s = client.all_w3()
+        labels = client.labels
 
-        results = []
-        total = len(self.client.all_w3())
-        for w3 in self.client.all_w3():
+        # 1. resolve the tag on every provider
+        heads: dict[int, int] = {}  # provider index -> block number
+        failed: set[int] = set()
+        for i, w3 in enumerate(w3s):
             try:
-                results.append(_read(w3))
+                heads[i] = int(w3.eth.get_block(tag)["number"])
             except Exception as exc:  # noqa: BLE001
-                log.warning("inbox quorum read failed: %s", exc)
-        if not results:
-            raise RuntimeError("inbox: all RPCs failed reading snapshot")
-        roots = {r[0] for r in results}
-        if len(roots) != 1:
-            from .chain import QuorumError
+                failed.add(i)
+                client.record_failure(labels[i], exc)
+                log.warning("%s: inbox %s block lookup failed: %s", labels[i], tag, redact(str(exc)))
+        if not heads:
+            raise RuntimeError(
+                f"inbox: all RPCs failed resolving {tag}: " + ", ".join(labels)
+            )
 
-            raise QuorumError(f"inbox RPCs disagree on snapshots({epoch}): {roots!r}")
-        min_ts = min(r[1] for r in results)
-        min_num = min(r[2] for r in results)
-        return results[0][0], L2View(timestamp=min_ts, number=min_num), len(results) == total
+        # 2. pin the lowest head (minus the confirmation depth for `latest`)
+        low_i = min(heads, key=lambda i: heads[i])
+        pinned = heads[low_i]
+        spread = max(heads.values()) - pinned
+        if spread > PIN_SPREAD_WARN:
+            # Finality jumps make honest providers differ by this much: no call
+            # failed, so this is a log line, not a failure count, once per hour.
+            now = time.time()
+            last = self._spread_logged.get(labels[low_i])
+            if last is None or now - last >= PIN_SPREAD_LOG_INTERVAL:
+                self._spread_logged[labels[low_i]] = now
+                log.warning(
+                    "%s: lowest %s block %d is %d blocks behind the highest provider; "
+                    "it sets the pinned block for every provider",
+                    labels[low_i],
+                    tag,
+                    pinned,
+                    spread,
+                )
+        if tag == LATEST:
+            pinned = max(0, pinned - self.route.inbox_chain.confirmations)
+
+        # 3. read snapshots(epoch) at that block on every provider
+        reads: list[ProviderRoot] = []
+        timestamps: list[int] = []
+        for i, w3 in enumerate(w3s):
+            if i in failed:
+                continue
+            try:
+                block = w3.eth.get_block(pinned)
+                root = self._contract(w3).functions.snapshots(epoch).call(
+                    block_identifier=pinned
+                )
+                reads.append(ProviderRoot(label=labels[i], root=bytes(root)))
+                timestamps.append(int(block["timestamp"]))
+            except Exception as exc:  # noqa: BLE001
+                failed.add(i)
+                client.record_failure(labels[i], exc)
+                log.warning(
+                    "%s: inbox quorum read at block %d failed: %s",
+                    labels[i],
+                    pinned,
+                    redact(str(exc)),
+                )
+        if not reads:
+            raise RuntimeError(
+                f"inbox: all RPCs failed reading snapshot at block {pinned}: "
+                + ", ".join(labels)
+            )
+        roots = {r.root for r in reads}
+        if len(roots) > 1:
+            client.record_split([(r.label, r.root) for r in reads])
+            log.warning(
+                "inbox quorum split for epoch %d at %s block %d: %s; no answer from: %s",
+                epoch,
+                tag,
+                pinned,
+                ", ".join(f"{r.label}=0x{r.root.hex()}" for r in reads),
+                ", ".join(labels[i] for i in sorted(failed)) or "none",
+            )
+        return QuorumRead(
+            root=reads[0].root if len(roots) == 1 else None,
+            view=L2View(timestamp=min(timestamps), number=pinned),
+            reads=tuple(reads),
+            missing=tuple(labels[i] for i in sorted(failed)),
+        )
+
+    def destination(self) -> str:
+        """The inbox's immutable L1 target: veaOutboxArbToEth, or routerArbToGnosis."""
+        name = (
+            "routerArbToGnosis" if self.route.kind == "arb_to_gnosis" else "veaOutboxArbToEth"
+        )
+        return self.client.with_failover(
+            lambda w3: self._contract(w3).functions[name]().call()
+        )
+
+    def epoch_period(self) -> int:
+        return int(
+            self.client.with_failover(
+                lambda w3: self._contract(w3).functions.epochPeriod().call()
+            )
+        )
 
     def l2_view(self, tag: str) -> L2View:
         block = self.client.block(tag)
@@ -226,6 +356,26 @@ class InboxContract:
         return [dict(event.process_log(entry)["args"]) | {
             "tx_hash": entry["transactionHash"].to_0x_hex()
         } for entry in raw]
+
+
+class RouterContract:
+    """RouterArbToGnosis on the L1 chain; read only for the startup pairing check."""
+
+    def __init__(self, client: ChainClient, address: str):
+        self.client = client
+        self.address = Web3.to_checksum_address(address)
+
+    def endpoints(self) -> tuple[str, str]:
+        """(veaInboxArbToGnosis, veaOutboxArbToGnosis)."""
+
+        def _read(w3: Web3) -> tuple[str, str]:
+            c = w3.eth.contract(address=self.address, abi=abi.ROUTER_ABI)
+            return (
+                c.functions.veaInboxArbToGnosis().call(),
+                c.functions.veaOutboxArbToGnosis().call(),
+            )
+
+        return self.client.with_failover(_read)
 
 
 class WethToken:

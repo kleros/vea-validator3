@@ -1,9 +1,12 @@
 """Regression tests for the implementation red-team findings."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from vea_challenger.claims import Claim, Party
-from vea_challenger.contracts import L2View
+import vea_challenger.detector as detector_mod
+from vea_challenger.contracts import L2View, QuorumRead
 from vea_challenger.detector import Detector
 from vea_challenger.store import (
     CHALLENGE_PENDING,
@@ -15,9 +18,23 @@ from vea_challenger.store import (
     ClaimRow,
     Store,
 )
-from vea_challenger.verdict import Verdict
+from vea_challenger.verdict import Decision, ProviderRoot, Verdict, VerdictInputs
 
-from conftest import FakeInbox, FakeNotifier, FakeOutbox
+from conftest import FakeInbox, FakeNotifier
+from conftest import FakeOutbox as _BaseOutbox
+
+
+
+class FakeOutbox(_BaseOutbox):
+    """Block-aware: a pinned claim_hash read sees the same hashes as latest."""
+
+    def __init__(self):
+        super().__init__()
+        self.client = SimpleNamespace(receipt_or_none=lambda h: None)
+
+    def claim_hash(self, epoch, block=None):
+        return super().claim_hash(epoch)
+
 
 CLAIMER = "0x00000000000000000000000000000000000000A1"
 US = "0x00000000000000000000000000000000000000C3"
@@ -39,6 +56,8 @@ def rig(tmp_path, params):
         store, outbox, inbox, params, notifier, US, devnet=False,
         log_scan_chunk=5_000, genesis_lookback_blocks=1_000,
     )
+    # block-time sample for the first-run lookback (12 s blocks)
+    outbox.block_timestamps.update({1: 1_000, 997: 1_000 + 996 * 12})
     return store, outbox, inbox, notifier, detector
 
 
@@ -69,6 +88,23 @@ def test_cursor_rewinds_on_failed_event(rig):
     assert store.get_cursor("outbox_events") == outbox.confirmed_head()
 
 
+def test_failed_event_pages_once_and_boundary_failure_sets_no_partial_flag(rig):
+    store, outbox, _, notifier, detector = rig
+    outbox.events = [_claimed_event(block=500)]
+    for _ in range(3):
+        detector.sync_events()
+    assert sum(1 for m in notifier.messages if "retry next tick" in str(m)) == 1
+    assert store.alert_sent(detector_mod._PARTIAL_SCAN) is None
+
+
+def test_first_event_failure_keeps_an_earlier_partial_flag(rig):
+    store, outbox, _, _, detector = rig
+    store.mark_alert(detector_mod._PARTIAL_SCAN, 500)
+    outbox.events = [_claimed_event(block=500)]  # block 500 has no timestamp: fails
+    detector.sync_events()
+    assert store.alert_sent(detector_mod._PARTIAL_SCAN) is not None
+
+
 def test_honest_verdict_withheld_without_full_quorum(rig):
     """Finding 2: terminal HONEST needs every configured RPC, not just reachable ones."""
     store, _, inbox, notifier, detector = rig
@@ -83,24 +119,62 @@ def test_honest_verdict_withheld_without_full_quorum(rig):
     assert detector.evaluate(row) == Verdict.WAIT
     assert store.get_claim(EPOCH).status == UNDECIDED
     assert notifier.has("WARNING", "withholding")
+    assert store.get_claim(EPOCH).note == "undecided: incomplete: 1 of 2 providers answered"
 
     inbox.complete = True
     row = store.get_claim(EPOCH)
     assert detector.evaluate(row) == Verdict.HONEST
 
 
-def test_challenge_verdict_allowed_without_full_quorum(rig):
-    """A mismatch from the reachable RPCs still challenges (safe direction)."""
-    store, _, inbox, _, detector = rig
+def _row_and_inputs(store):
     row = ClaimRow(
         epoch=EPOCH,
         status=UNDECIDED,
         claim=Claim(state_root=ROOT_A, claimer=CLAIMER, timestamp_claimed=EPOCH_END + 60),
     )
     store.upsert_claim(row)
+    return row
+
+
+def test_single_answering_provider_mismatch_waits(rig):
+    """1.2: one answering provider cannot trigger a challenge."""
+    store, _, inbox, notifier, detector = rig
+    detector.min_challenge_agreement = 2
+    row = _row_and_inputs(store)
+    inbox.reads["finalized"] = QuorumRead(
+        ROOT_B, L2View(timestamp=EPOCH_END + 10, number=1),
+        (ProviderRoot("inbox#0", ROOT_B),), ("inbox#1",),
+    )
+    assert detector.evaluate(row) == Verdict.WAIT
+    assert store.get_claim(EPOCH).status == UNDECIDED
+    assert notifier.has("WARNING", "insufficient agreement")
+    assert "insufficient agreement" in store.get_claim(EPOCH).note
+
+
+def test_two_agreeing_providers_challenge(rig):
+    store, _, inbox, _, detector = rig
+    detector.min_challenge_agreement = 2
+    row = _row_and_inputs(store)
     inbox.finalized = (ROOT_B, L2View(timestamp=EPOCH_END + 10, number=1))
-    inbox.complete = False
     assert detector.evaluate(row) == Verdict.CHALLENGE
+    assert store.get_claim(EPOCH).true_root == "0x" + ROOT_B.hex()
+
+
+def test_override_challenges_on_single_source(rig, monkeypatch):
+    """The 1.1 override (stubbed decision) may challenge on fewer answers."""
+    store, _, inbox, notifier, detector = rig
+    detector.min_challenge_agreement = 2
+    detector.challenge_on_ambiguity = True
+    row = _row_and_inputs(store)
+    inbox.reads["finalized"] = QuorumRead(
+        ROOT_B, L2View(timestamp=EPOCH_END + 10, number=1),
+        (ProviderRoot("inbox#0", ROOT_B),), ("inbox#1",),
+    )
+    monkeypatch.setattr(
+        detector_mod, "decide_detail", lambda v: Decision(Verdict.CHALLENGE, ROOT_B, "override")
+    )
+    assert detector.evaluate(row) == Verdict.CHALLENGE
+    assert notifier.has("CRITICAL", "override")
 
 
 def test_frontrun_while_challenge_pending(rig):
@@ -157,3 +231,20 @@ def test_verified_with_deleted_hash_marks_withdrawn(rig):
     detector.sync_events()
     assert store.get_claim(EPOCH).status == WITHDRAWN
     assert notifier.has("WARNING", "check whether the challenge won")
+
+
+def test_count_rule_is_not_bypassed_by_the_detector(rig, monkeypatch):
+    """The detector acts on decide_detail's WAIT: a WAIT never becomes a challenge."""
+    store, _, inbox, notifier, detector = rig
+    row = _row_and_inputs(store)
+    inbox.finalized = (ROOT_B, L2View(timestamp=EPOCH_END + 10, number=1))
+    monkeypatch.setattr(
+        detector_mod,
+        "decide_detail",
+        lambda v: Decision(
+            Verdict.WAIT, reason="insufficient agreement for epoch 100: 1 provider(s) (inbox#0) "
+            "agree on a mismatch, fewer than 2"
+        ),
+    )
+    assert detector.evaluate(row) == Verdict.WAIT
+    assert store.get_claim(EPOCH).true_root is None

@@ -7,6 +7,8 @@ import logging
 import threading
 import urllib.request
 
+from .chain import redact, register_endpoint
+
 log = logging.getLogger(__name__)
 
 INFO = "INFO"
@@ -20,8 +22,12 @@ class Notifier:
     def __init__(self, webhook_url: str | None, route_name: str):
         self.webhook_url = webhook_url
         self.route_name = route_name
+        if webhook_url:
+            # The URL carries the webhook token: redact() (and the log filter) hide it.
+            register_endpoint(webhook_url, "<webhook>", hide_host=True)
 
     def send(self, level: str, message: str) -> None:
+        message = redact(message)
         line = f"[vea-challenger:{self.route_name}] {level}: {message}"
         if level == CRITICAL:
             log.critical("%s", message)
@@ -44,4 +50,6 @@ class Notifier:
             )
             urllib.request.urlopen(req, timeout=10)
         except Exception as exc:  # noqa: BLE001
-            log.warning("webhook delivery failed: %s", exc)
+            log.warning(
+                "webhook delivery failed: %s: %s", type(exc).__name__, redact(str(exc))
+            )

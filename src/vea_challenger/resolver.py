@@ -69,6 +69,12 @@ class Resolver:
         self.challenge_address = challenge_address
         self.dry_run = dry_run
         self._adoption_checked: set[int] = set()
+        # The only L2->L1 message we accept: from the inbox to the route's L1
+        # target (the outbox for ArbToEth, the router for ArbToGnosis).
+        route = inbox.route
+        self._ticket_destination = (
+            route.router_address if route.kind == "arb_to_gnosis" else route.outbox_address
+        )
 
     def tick(self, rows: list[ClaimRow]) -> None:
         if self.dry_run:
@@ -83,6 +89,14 @@ class Resolver:
                     self.withdraw(row)
             except Exception as exc:  # noqa: BLE001 - resolution retries next tick
                 log.warning("resolver step failed for epoch %s: %s", row.epoch, exc)
+
+    def _parse_ticket(self, receipt, check_destination: bool = True) -> dict:
+        return parse_l2tol1_event(
+            self.inbox.client,
+            receipt,
+            self.inbox.address,
+            self._ticket_destination if check_destination else None,
+        )
 
     def _ours(self, row: ClaimRow) -> bool:
         return row.claim.challenger.lower() == self.challenge_address.lower()
@@ -102,7 +116,10 @@ class Resolver:
 
         fn = self.inbox.send_snapshot_fn(row.epoch, row.claim)
         receipt = self.l2_sender.send(fn, epoch=row.epoch, action="send_snapshot")
-        msg = parse_l2tol1_event(self.inbox.client, receipt)
+        # Our tx calls the inbox directly, so its log is the inbox's; skip the
+        # destination check so a misconfigured router can't make every tick
+        # re-send sendSnapshot.
+        msg = self._parse_ticket(receipt, check_destination=False)
         row.snapshot_tx = receipt["transactionHash"].to_0x_hex()
         row.l2tol1_json = json.dumps(msg)
         row.status = SNAPSHOT_SENT
@@ -137,8 +154,8 @@ class Resolver:
                 receipt = self.inbox.client.receipt_or_none(ev["tx_hash"])
                 if receipt is None:
                     continue
-                msg = parse_l2tol1_event(self.inbox.client, receipt)
-                carried = decode_claim_from_l2tol1_data(msg["data"])
+                msg = self._parse_ticket(receipt)
+                carried = decode_claim_from_l2tol1_data(msg["data"], row.epoch)
                 if carried is not None and carried.hash() == row.claim.hash():
                     return ev["tx_hash"], json.dumps(msg)
             except Exception as exc:  # noqa: BLE001
@@ -156,7 +173,7 @@ class Resolver:
                 else None
             )
             if receipt is not None:
-                row.l2tol1_json = json.dumps(parse_l2tol1_event(self.inbox.client, receipt))
+                row.l2tol1_json = json.dumps(self._parse_ticket(receipt))
                 self.store.upsert_claim(row)
             else:
                 row.status = CHALLENGED  # re-run step 1

@@ -28,12 +28,19 @@ WITHDRAWN = "WITHDRAWN"  # deposit + reward withdrawn; terminal
 MISSED = "MISSED"  # claim verified before we could act; terminal
 LOST = "LOST"  # resolution ruled the claimer honest; terminal
 DESYNC = "DESYNC"  # cannot reconstruct on-chain claim hash; needs a human
+# Verified as honest (honest == Claimer) while we never reached a verdict of our
+# own (SEEN/UNDECIDED); terminal, and always paged. HONEST is reserved for rows
+# that Detector.evaluate() ruled honest.
+VERIFIED_UNDECIDED = "VERIFIED_UNDECIDED"
 
 ACTIVE_STATES = (
     SEEN,
     UNDECIDED,
     CHALLENGE_PENDING,
     CHALLENGED,
+    # Reconciled every tick (a third-party challenge can be reorged out), but
+    # neither challenged nor resolved by us while it stays in this state.
+    CHALLENGED_BY_OTHER,
     SNAPSHOT_SENT,
     L1_EXECUTED,
     RESOLVED,
@@ -66,7 +73,13 @@ CREATE TABLE IF NOT EXISTS tx_journal (
     nonce INTEGER,
     tx_hash TEXT,
     status TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    max_fee_per_gas TEXT,
+    max_priority_fee_per_gas TEXT
+);
+CREATE TABLE IF NOT EXISTS alerts (
+    key TEXT PRIMARY KEY,
+    sent_at INTEGER NOT NULL
 );
 """
 
@@ -92,6 +105,11 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.executescript(_SCHEMA)
+        # Journals created before the fee columns existed: add them (NULL fees).
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(tx_journal)")}
+        for col in ("max_fee_per_gas", "max_priority_fee_per_gas"):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE tx_journal ADD COLUMN {col} TEXT")
         self._conn.commit()
 
     def close(self) -> None:
@@ -177,15 +195,38 @@ class Store:
     # -- tx journal -----------------------------------------------------------
 
     def journal_intent(
-        self, epoch: int, action: str, chain: str, sender: str, nonce: int
+        self,
+        epoch: int,
+        action: str,
+        chain: str,
+        sender: str,
+        nonce: int,
+        fees: tuple[int, int] | None = None,
     ) -> int:
+        """``fees`` is (maxFeePerGas, maxPriorityFeePerGas) as signed; wei values are
+        kept as TEXT because they can exceed SQLite's 64-bit INTEGER."""
+        max_fee, max_prio = (str(fees[0]), str(fees[1])) if fees else (None, None)
         cur = self._conn.execute(
-            "INSERT INTO tx_journal (epoch, action, chain, sender, nonce, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, 'INTENT', ?)",
-            (epoch, action, chain, sender, nonce, int(time.time())),
+            "INSERT INTO tx_journal (epoch, action, chain, sender, nonce, status, created_at, "
+            "max_fee_per_gas, max_priority_fee_per_gas) "
+            "VALUES (?, ?, ?, ?, ?, 'INTENT', ?, ?, ?)",
+            (epoch, action, chain, sender, nonce, int(time.time()), max_fee, max_prio),
         )
         self._conn.commit()
         return int(cur.lastrowid)
+
+    def journal_fees(self, chain: str, sender: str, nonce: int) -> list[tuple[int, int, bool]]:
+        """Every (maxFeePerGas, maxPriorityFeePerGas, broadcast) journaled at this
+        nonce; ``broadcast`` is whether the attempt got a tx hash."""
+        rows = self._conn.execute(
+            "SELECT max_fee_per_gas, max_priority_fee_per_gas, tx_hash FROM tx_journal "
+            "WHERE chain = ? AND sender = ? AND nonce = ? AND max_fee_per_gas IS NOT NULL",
+            (chain, sender, nonce),
+        ).fetchall()
+        return [
+            (int(r["max_fee_per_gas"]), int(r["max_priority_fee_per_gas"]), r["tx_hash"] is not None)
+            for r in rows
+        ]
 
     def journal_sent(self, journal_id: int, tx_hash: str) -> None:
         self._conn.execute(
@@ -207,3 +248,27 @@ class Store:
             q += " AND action = ?"
             args = (action,)
         return self._conn.execute(q, args).fetchall()
+
+    # -- alert de-duplication -------------------------------------------------
+    # Keys are free-form strings chosen by the caller, e.g. "deadline:<epoch>:4h".
+    # They survive a restart so a once-only alert is not repeated after one.
+
+    def alert_sent(self, key: str) -> int | None:
+        """Unix time the alert `key` was last marked as sent, or None."""
+        r = self._conn.execute("SELECT sent_at FROM alerts WHERE key = ?", (key,)).fetchone()
+        return int(r["sent_at"]) if r else None
+
+    def mark_alert(self, key: str, ts: int | None = None) -> None:
+        self._conn.execute(
+            "INSERT INTO alerts (key, sent_at) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET sent_at=excluded.sent_at",
+            (key, int(time.time()) if ts is None else int(ts)),
+        )
+        self._conn.commit()
+
+    def clear_alerts(self, prefix: str) -> None:
+        """Forget every alert whose key starts with `prefix`."""
+        self._conn.execute(
+            "DELETE FROM alerts WHERE substr(key, 1, ?) = ?", (len(prefix), prefix)
+        )
+        self._conn.commit()

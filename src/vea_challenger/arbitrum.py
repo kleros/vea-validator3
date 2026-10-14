@@ -35,8 +35,19 @@ ROUTE_SELECTOR = Web3.keccak(
 )[:4]
 
 
-def parse_l2tol1_event(l2_client: ChainClient, receipt: TxReceipt) -> dict:
-    """Extract the ArbSys L2ToL1Tx message from a sendSnapshot receipt."""
+def parse_l2tol1_event(
+    l2_client: ChainClient,
+    receipt: TxReceipt,
+    caller: str,
+    destination: str | None = None,
+) -> dict:
+    """Extract the inbox's ArbSys L2ToL1Tx message from a sendSnapshot receipt.
+
+    Only a log whose ``caller`` is the inbox (and, when given, whose
+    ``destination`` is the route's L1 target) counts: a third party's tx can
+    wrap ``sendSnapshot`` and emit its own L2->L1 message first, carrying any
+    calldata it likes.
+    """
     contract = l2_client.w3.eth.contract(
         address=Web3.to_checksum_address(abi.ARBSYS_ADDRESS), abi=abi.ARBSYS_ABI
     )
@@ -46,6 +57,10 @@ def parse_l2tol1_event(l2_client: ChainClient, receipt: TxReceipt) -> dict:
             continue
         parsed = event.process_log(entry)
         a = parsed["args"]
+        if a["caller"].lower() != caller.lower():
+            continue
+        if destination is not None and a["destination"].lower() != destination.lower():
+            continue
         return {
             "caller": a["caller"],
             "destination": a["destination"],
@@ -56,14 +71,16 @@ def parse_l2tol1_event(l2_client: ChainClient, receipt: TxReceipt) -> dict:
             "callvalue": int(a["callvalue"]),
             "data": "0x" + bytes(a["data"]).hex(),
         }
-    raise ValueError("no L2ToL1Tx event found in receipt")
+    raise ValueError(f"no L2ToL1Tx event from {caller} found in receipt")
 
 
-def decode_claim_from_l2tol1_data(data_hex: str) -> Claim | None:
+def decode_claim_from_l2tol1_data(data_hex: str, epoch: int | None = None) -> Claim | None:
     """Decode the Claim struct from a resolveDisputedClaim / route calldata.
 
     Used to check whether a third party's sendSnapshot carried the correct
-    (post-challenge) struct before adopting their ticket as ours.
+    (post-challenge) struct before adopting their ticket as ours. With
+    ``epoch``, a message for any other epoch decodes to None: a wrapper can
+    send our struct for a different epoch in the same tx.
     """
     data = bytes.fromhex(data_hex.removeprefix("0x"))
     selector, payload = data[:4], data[4:]
@@ -77,6 +94,8 @@ def decode_claim_from_l2tol1_data(data_hex: str) -> Claim | None:
     else:
         return None
     decoded = abi_decode(types, payload)
+    if epoch is not None and int(decoded[0]) != epoch:
+        return None
     c = decoded[claim_idx]
     return Claim(
         state_root=bytes(c[0]),
