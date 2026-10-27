@@ -209,6 +209,9 @@ class Resolver:
     def withdraw(self, row: ClaimRow) -> None:
         if row.claim.honest != Party.CHALLENGER or not self._ours(row):
             return
+        if self.dry_run:
+            log.info("dry-run: would withdraw the deposit for epoch %s", row.epoch)
+            return
         fn = self.outbox.contract().functions.withdrawChallengeDeposit(
             row.epoch, row.claim.as_tuple()
         )

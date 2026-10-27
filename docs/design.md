@@ -282,12 +282,14 @@ tick (nothing else acts on it) until `Verified` or the claim hash is deleted.
   check balances. It is the fallback for a verify and withdraw in one block.
 - **Reorg recovery (2.1).** A revert is when the confirmed-height hash matches the stored struct's
   variant with `challenger == 0` and `honest == None`, for a row in `CHALLENGED`, `SNAPSHOT_SENT`,
-  `L1_EXECUTED` or `CHALLENGED_BY_OTHER`; it is checked every tick. The bridge-shutdown branch comes
-  first: after a shutdown the escape hatch zeroed `challenger` (deposit refunded), so the zeroed struct is
-  written and the row goes to `WITHDRAWN` with a WARNING (no re-challenge). Otherwise, for our own
-  states the transition also needs our `challenge_tx`, when known, to have no successful receipt (none
-  found, or status 0). A receipt mined above the block the scan has reached means "not scanned yet"
-  and is ignored. Until the transition is taken `row.claim` is not overwritten; the matched struct and
+  `L1_EXECUTED` or `CHALLENGED_BY_OTHER`; it is checked every tick. First, for our own states, a
+  successful receipt for our `challenge_tx` mined above the block the scan has reached means "not
+  scanned yet": no transition. This comes before the shutdown branch, because the outbox accepts a
+  challenge during a shutdown too. Then the bridge-shutdown branch: after a shutdown the escape hatch
+  zeroed `challenger` (deposit refunded), so the zeroed struct is written and the row goes to
+  `WITHDRAWN` with a WARNING (no re-challenge). Otherwise, for our own states the transition also
+  needs our `challenge_tx`, when known, to have no successful receipt (none found, or status 0).
+  Until the transition is taken `row.claim` is not overwritten; the matched struct and
   the new status are written together, so an exception changes nothing and the next tick retries.
   Our `CHALLENGED`, `SNAPSHOT_SENT` and `L1_EXECUTED` rows go back to `CHALLENGE_PENDING` (for the
   latter two `snapshot_tx`, `l2tol1_json` and `execute_tx` are cleared; CRITICAL) and the same tick

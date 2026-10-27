@@ -477,6 +477,24 @@ def test_escape_hatched_snapshot_sent_with_receipt_is_withdrawn_at_once(rig, par
     assert _critical(notifier) == []
 
 
+def test_challenge_sent_in_a_shutdown_and_mined_above_the_scan_block_is_not_withdrawn(rig, params):
+    """The outbox's challenge() works during a shutdown too. Until the scan reaches
+    our receipt's block, a zero challenger there is our own challenge not scanned
+    yet, not the escape hatch."""
+    store, outbox, _, notifier, detector = rig
+    _at_cursor(store)
+    _ours_row(store)
+    outbox.pinned[EPOCH] = _base().hash()  # the scan block predates our challenge
+    outbox.claim_hashes[EPOCH] = _base(challenger=US).hash()
+    outbox.receipts["0xlost"] = {"status": 1, "blockNumber": CURSOR + 3}
+    outbox._now = (params.timeout_epochs + 5) * params.epoch_period + params.epoch_period * 50
+    outbox.latest_verified = 0
+    detector.reconcile(store.get_claim(EPOCH))
+    got = store.get_claim(EPOCH)
+    assert got.status == CHALLENGED and got.claim.challenger == US and got.challenge_tx == "0xlost"
+    assert notifier.messages == []
+
+
 def test_third_party_revert_needs_no_receipt_gate(rig):
     store, outbox, _, _, detector = rig
     _at_cursor(store)

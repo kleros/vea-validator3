@@ -563,11 +563,24 @@ class Detector:
         except (KeyError, TypeError):
             return None
 
+    def _our_challenge_receipt(self, row: ClaimRow):
+        """Our challenge tx's receipt if it succeeded, else None."""
+        if row.status == CHALLENGED_BY_OTHER or not row.challenge_tx:
+            return None
+        receipt = self.outbox.client.receipt_or_none(row.challenge_tx)
+        if receipt is None or self._receipt_field(receipt, "status") == 0:
+            return None
+        return receipt
+
     def _revert(self, row: ClaimRow, matched: Claim, block: int) -> None:
         """The confirmed-height hash shows no challenger: our challenge was reorged
         out, or (after a bridge shutdown) the escape hatch zeroed it. `row` is
         written once, with the matched struct and the new status together."""
         epoch = row.epoch
+        receipt = self._our_challenge_receipt(row)
+        landed = None if receipt is None else self._receipt_field(receipt, "blockNumber")
+        if landed is not None and int(landed) > block:
+            return  # mined above what the scan has reached: not scanned yet
         if self._bridge_shutdown():
             # After a shutdown anyone may call withdrawChallengerEscapeHatch,
             # which zeroes `challenger` without an event: the deposit was
@@ -582,14 +595,9 @@ class Detector:
                 WARNING, f"epoch {epoch}: escape hatch used (bridge shutdown); not re-challenging"
             )
             return
-        if row.status != CHALLENGED_BY_OTHER and row.challenge_tx:
-            receipt = self.outbox.client.receipt_or_none(row.challenge_tx)
-            if receipt is not None and self._receipt_field(receipt, "status") != 0:
-                landed = self._receipt_field(receipt, "blockNumber")
-                if landed is not None and int(landed) > block:
-                    return  # mined above what the scan has reached: not scanned yet
-                self._reorg_held(row)
-                return
+        if receipt is not None:
+            self._reorg_held(row)
+            return
         # Taking the transition: the suspicion is resolved either way.
         self._clear_suspect(epoch)
         row.claim = matched
