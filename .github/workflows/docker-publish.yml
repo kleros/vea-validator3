@@ -6,15 +6,75 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# Read-only by default; the job asks for what it needs.
 permissions:
   contents: read
-  packages: write
+
+# One publish at a time, in push order, so :latest cannot move back to an older
+# release. queue: max keeps every pending run (the default keeps one and cancels
+# the rest, which would drop that tag's version image). actionlint 1.7.12 does
+# not know `queue` yet (GitHub added it on 2026-05-07).
+concurrency:
+  group: publish-docker
+  queue: max
+  cancel-in-progress: false
 
 jobs:
   build-and-push:
+    # workflow_dispatch has no ref filter; a manual run may only publish main.
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    # Publishing waits here for approval. Required reviewers and allowed refs
+    # (main, v* tags) are repo settings. Create the environment before this
+    # file reaches main, or the first run creates it with no protection.
+    environment: docker-publish
     runs-on: ubuntu-latest
+    permissions:
+      # actions/checkout
+      contents: read
+      # push to ghcr.io
+      packages: write
+      # actions/attest: Sigstore OIDC token, attestation storage, storage record
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@002fdce3c6a235733a90a27c80493a3241e56863 # v2.12.1
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # main's history and every tag, for the release checks below.
+          fetch-depth: 0
+          # Nothing uses git credentials after checkout; GHCR auth comes from
+          # docker/login-action.
+          persist-credentials: false
+
+      # A tag publishes only if its commit is on main, and moves :latest only if
+      # it is the highest release tag reachable from main. Pre-releases
+      # (v1.2.0-rc.1) never move :latest. This is a guard against mistakes: a
+      # tag on another commit runs that commit's copy of this file, so the tag
+      # ruleset and the environment's reviewers are the real control.
+      - id: release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not on main"
+            exit 1
+          fi
+          # A git failure stops the step here (set -e) instead of leaving
+          # newest=false on a green run.
+          tags=$(git tag --merged origin/main --list 'v*')
+          newest=$(printf '%s\n' "$tags" \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+          if [ "$newest" = "$GITHUB_REF_NAME" ]; then
+            echo "newest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "newest=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
@@ -31,16 +91,35 @@ jobs:
           labels: |
             org.opencontainers.image.title=vea-challenger
             org.opencontainers.image.description=Independent challenger bot for the Vea optimistic bridge
-            org.opencontainers.image.source=https://github.com/kleros/vea-validator3
-            org.opencontainers.image.license=MIT
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+          # The default (latest=auto) adds :latest to every v* tag, older ones
+          # included; the release step decides instead. main pushes publish
+          # :main and :sha-*, never :latest.
+          flavor: |
+            latest=false
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ steps.release.outputs.newest == 'true' }}
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
             type=sha,prefix=sha-,format=short
 
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      - id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # No build cache in or out: a GHA cache that branch runs can write
+          # would feed release images (vea PR 528 review, G1). The image builds
+          # in about 40 s from nothing.
+          no-cache: true
+
+      # Signed SLSA provenance, stored in GHCR next to the image. Operators
+      # check it with `gh attestation verify` before moving their digest pin.
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
