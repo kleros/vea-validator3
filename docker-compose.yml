@@ -25,6 +25,7 @@ services:
       - .env
     # The container runs as uid 1000. If ./data does not exist, Docker creates
     # it owned by root and the bot exits with "unable to open database file".
+    # One ./data per route: every route uses the same database file name.
     volumes:
       - ./data:/data
     restart: unless-stopped

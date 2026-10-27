@@ -133,6 +133,12 @@ how to move the pin.
 route (`VEA_ROUTE_FILE`), also mount the TOML file under `/data` and point the
 env var at it, e.g. `-v $(pwd)/route.toml:/data/route.toml -e VEA_ROUTE_FILE=/data/route.toml`.
 
+Use one `./data` directory per route. The image uses the same database path for
+every route, and the database keys claims by epoch number only. Running two
+routes on one `./data`, or changing `VEA_ROUTE` on an existing one, mixes their
+claims, scan cursors and tx journal. A scan cursor from another chain can make
+the bot skip blocks and miss claims.
+
 ## Development
 
 ```bash
