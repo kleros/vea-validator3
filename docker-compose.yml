@@ -1,19 +1,31 @@
 # vea-challenger docker-compose
-# Usage: docker compose up -d
-# The image is pulled from GitHub Container Registry:
-#   ghcr.io/kleros/vea-validator3:latest
-# or a specific version tag:
-#   ghcr.io/kleros/vea-validator3:v0.1.0
-# or a specific commit sha:
-#   ghcr.io/kleros/vea-validator3:sha-abc123
+# Usage:
+#   mkdir -p data && sudo chown 1000:1000 data
+#   docker compose up -d
+#
+# The image is pinned by version and digest. A tag can be moved to another
+# image; a digest cannot, and compose never swaps a pinned image behind your
+# back. To upgrade to a release:
+#   1. check its provenance (releases after 0.1.0 are attested):
+#        gh attestation verify oci://ghcr.io/kleros/vea-validator3:<version> \
+#          --repo kleros/vea-validator3 --source-ref refs/tags/v<version> \
+#          --signer-workflow kleros/vea-validator3/.github/workflows/docker-publish.yml \
+#          --deny-self-hosted-runners
+#   2. read its digest and put both below:
+#        docker buildx imagetools inspect ghcr.io/kleros/vea-validator3:<version>
+#   3. docker compose up -d
+# Published tags: <version> (e.g. 0.1.0, no "v"), latest (the newest release),
+# main (the tip of main, unreleased) and sha-<7 hex>. Images are linux/amd64 only.
 
 services:
   vea-challenger:
-    # For production is prefered to use a specific tag/sha version instead of latest
-    image: ghcr.io/kleros/vea-validator3:latest
+    image: ghcr.io/kleros/vea-validator3:0.1.0@sha256:6749c78e19370d83ce70037279fcd0dcfe96138a48bf4a1fbf0e1d389bb8168a
     container_name: vea-challenger
     env_file:
       - .env
+    # The container runs as uid 1000. If ./data does not exist, Docker creates
+    # it owned by root and the bot exits with "unable to open database file".
+    # One ./data per route: every route uses the same database file name.
     volumes:
       - ./data:/data
     restart: unless-stopped

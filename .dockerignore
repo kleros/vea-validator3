@@ -1,17 +1,12 @@
-.venv/
-.git/
-.github/
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-.env
-*.db
-*.db-wal
-*.db-shm
-.pytest_cache/
-.DS_Store
-tests/
-docs/
-Dockerfile
-.dockerignore
+# Allowlist: the build reads only these. Everything else (.env*, data/, keys,
+# local databases, .venv, .git) never reaches the builder.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+
+# Unanchored patterns need **/: `.env` alone matches only the context root.
+**/__pycache__
+**/*.py[cod]
+**/.env*

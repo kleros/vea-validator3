@@ -83,39 +83,61 @@ bot ever logs `INSUFFICIENT FUNDS to challenge`, treat it as an incident.
 
 ## Docker
 
+Images are published to `ghcr.io/kleros/vea-validator3` (linux/amd64) with
+these tags: `<version>` (e.g. `0.1.0`, no `v`), `latest` (the newest release
+only), `main` (the tip of `main`, unreleased) and `sha-<7 hex>`. Run a release
+pinned by digest, not `latest`: a tag can be moved to another image, a digest
+cannot. Releases after `0.1.0` carry a signed build provenance; check it before
+you move your pin:
+
 ```bash
-# Build locally
-docker build -t vea-challenger .
+gh attestation verify oci://ghcr.io/kleros/vea-validator3:<version> \
+  --repo kleros/vea-validator3 --source-ref refs/tags/v<version> \
+  --signer-workflow kleros/vea-validator3/.github/workflows/docker-publish.yml \
+  --deny-self-hosted-runners
+docker buildx imagetools inspect ghcr.io/kleros/vea-validator3:<version>   # its digest
+```
 
-# Or pull the pre-built image from GitHub Container Registry
-docker pull ghcr.io/kleros/vea-validator3:latest
-
+```bash
 # state (SQLite db) persists under ./data on the host, mapped to /data in the container
 # the container runs as uid 1000, so the host dir must be writable by that uid
+# (if Docker creates ./data itself, it is root-owned and the bot cannot open its db)
 mkdir -p data
-chown 1000:1000 data
+sudo chown 1000:1000 data
+
+IMAGE=ghcr.io/kleros/vea-validator3:<version>@sha256:<digest>
 docker run -d --name vea-challenger \
   --env-file .env \
   -v "$(pwd)/data:/data" \
-  vea-challenger              # runs `vea-challenger run`
+  "$IMAGE"                    # runs `vea-challenger run`
 
 # other subcommands override CMD, entrypoint is fixed to the `vea-challenger` binary
-docker run --rm --env-file .env -v "$(pwd)/data:/data" vea-challenger status
-docker run --rm --env-file .env -v "$(pwd)/data:/data" vea-challenger scan
-docker run --rm --env-file .env -v "$(pwd)/data:/data" vea-challenger challenge --epoch 246810
+docker run --rm --env-file .env -v "$(pwd)/data:/data" "$IMAGE" status
+docker run --rm --env-file .env -v "$(pwd)/data:/data" "$IMAGE" scan
+docker run --rm --env-file .env -v "$(pwd)/data:/data" "$IMAGE" challenge --epoch 246810
+
+# or build locally (the .dockerignore keeps .env*, data/ and keys out of the build)
+docker build -t vea-challenger .
 ```
 
-Or use docker-compose:
+Or use docker-compose, after the same `mkdir`/`chown`:
 
 ```bash
 docker compose up -d
 ```
 
-See [`docker-compose.yml`](docker-compose.yml) for the pre-configured setup pointing to `ghcr.io/kleros/vea-validator3`.
+[`docker-compose.yml`](docker-compose.yml) pins a release by digest and explains
+how to move the pin.
 
 `VEA_DB_PATH` defaults to `/data/vea-challenger.db` in the image. For a custom
 route (`VEA_ROUTE_FILE`), also mount the TOML file under `/data` and point the
 env var at it, e.g. `-v $(pwd)/route.toml:/data/route.toml -e VEA_ROUTE_FILE=/data/route.toml`.
+
+Use one `./data` directory per route. The image uses the same database path for
+every route, and the database keys claims by epoch number only. Running two
+routes on one `./data`, or changing `VEA_ROUTE` on an existing one, mixes their
+claims, scan cursors and tx journal. A scan cursor from another chain can make
+the bot skip blocks and miss claims.
 
 ## Development
 

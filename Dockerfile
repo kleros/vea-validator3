@@ -2,12 +2,12 @@
 # Builder image
 #
 
-# uv version pinned for reproducible installs
-ARG UV_VERSION=0.11.27
-FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+# Base images pinned by digest: a tag can be moved to other content, a digest
+# cannot. Bump tag and digest together (Dependabot's docker ecosystem does both).
+FROM ghcr.io/astral-sh/uv:0.11.27@sha256:4d01caf3b22dfd11003455e2e68153da08c4ee1fa54fdbd166c6282d22693419 AS uv
 
 # Python version for vea-challenger (matches .python-version)
-FROM python:3.12-alpine AS builder
+FROM python:3.12.15-alpine3.24@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4 AS builder
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
@@ -26,9 +26,10 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 COPY src ./src
 COPY README.md ./
 
-# Install the project itself into the venv built above
+# Install the project itself into the venv as a regular (non-editable) package,
+# so the runtime image needs only the venv, not the source tree
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    uv sync --frozen --no-dev --no-editable
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -41,20 +42,20 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 #
 # This is the final layer that will be deployed and run
 
-FROM python:3.12-alpine AS vea-challenger
+FROM python:3.12.15-alpine3.24@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4 AS vea-challenger
 
 # Fixed uid/gid (not -S/system range) so a host-side `chown 1000:1000` on a
 # bind-mounted ./data works the same on every host.
 RUN addgroup -g 1000 app && adduser -D -u 1000 -G app app \
     && mkdir -p /data && chown -R app:app /data
 
+# Copy only the built venv from the builder (same absolute path as the builder
+# stage: the venv's shebangs are baked with this path at build time). Owned by
+# root, so the bot cannot rewrite its own code.
+COPY --from=builder /app/.venv /app/.venv
+
 USER app
 WORKDIR /app
-
-# Copy only the built venv and source from the builder (same absolute path as
-# the builder stage: the venv's shebangs are baked with this path at build time)
-COPY --from=builder --chown=app:app /app/.venv ./.venv
-COPY --from=builder --chown=app:app /app/src ./src
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     VEA_DB_PATH=/data/vea-challenger.db

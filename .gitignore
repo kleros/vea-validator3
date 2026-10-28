@@ -8,3 +8,9 @@ dist/
 *.db-wal
 *.db-shm
 .pytest_cache/
+.env.*
+!.env.example
+data/
+*.providers.json
+*.pem
+*.key
