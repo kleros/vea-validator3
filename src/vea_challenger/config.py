@@ -149,16 +149,20 @@ class Settings(BaseSettings):
     db_path: Path | None = None  # default: ./vea-challenger-<route>.db
     poll_interval: float = 30.0
     log_scan_chunk: int = 5_000
-    # First-run scan window on the outbox chain. Claims are only challengeable
-    # for ~epochPeriod + sequencerDelayLimit + minChallengePeriod (~29h on the
-    # testnet route), so a couple of days of blocks is enough for actionable
-    # claims; older history is informational only.
-    genesis_lookback_blocks: int = 20_000
+    # First-run scan window on the outbox chain, in blocks. None: derived from
+    # the challenge budget (PRD 2.4); a value only ever widens that window.
+    genesis_lookback_blocks: int | None = None
 
     dry_run: bool = False
     # Challenge when the verdict is ambiguous at the deadline (RPC disagreement /
     # stalled finality). Losing a challenge costs the entire deposit; default off.
     challenge_on_ambiguity: bool = False
+    # CHALLENGE needs at least this many inbox RPCs agreeing on the root; may not
+    # exceed the number of configured inbox RPCs (PRD 1.2).
+    min_challenge_agreement: int = 2
+    # Warn when no Claimed event was seen for this many epochs; None disables.
+    # Never applies on devnet routes (PRD 3.3).
+    liveness_epochs: int | None = 12
     # Wei kept aside for gas; never spent on deposits.
     gas_reserve_wei: int = 10**16
     webhook_url: str | None = None

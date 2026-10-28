@@ -55,6 +55,9 @@ OUTBOX_ABI = [
     _view("latestVerifiedEpoch", [], [_arg("", "uint256")]),
     _view("stateRoot", [], [_arg("", "bytes32")]),
     _view("epochNow", [], [_arg("epoch", "uint256")]),
+    # Pairing getters (startup check): ArbToEth names the inbox, ArbToGnosis the router.
+    _view("veaInboxArbToEth", [], [_arg("", "address")]),
+    _view("routerArbToGnosis", [], [_arg("", "address")]),
     _view(
         "hashClaim",
         [_CLAIM_PARAM],
@@ -109,6 +112,9 @@ INBOX_ABI = [
     _view("epochPeriod", [], [_arg("", "uint256")]),
     _view("count", [], [_arg("", "uint64")]),
     _view("epochNow", [], [_arg("epoch", "uint256")]),
+    # Pairing getters (startup check): ArbToEth names the outbox, ArbToGnosis the router.
+    _view("veaOutboxArbToEth", [], [_arg("", "address")]),
+    _view("routerArbToGnosis", [], [_arg("", "address")]),
     _fn("saveSnapshot", []),
     # ArbToEth signature
     _fn("sendSnapshot", [_arg("_epoch", "uint256"), _CLAIM_PARAM]),
@@ -139,6 +145,12 @@ INBOX_GNOSIS_SEND_SNAPSHOT_ABI = [
         "sendSnapshot",
         [_arg("_epoch", "uint256"), _arg("_gasLimit", "uint256"), _CLAIM_PARAM],
     ),
+]
+
+# RouterArbToGnosis on the L1 chain: only the pairing getters.
+ROUTER_ABI = [
+    _view("veaInboxArbToGnosis", [], [_arg("", "address")]),
+    _view("veaOutboxArbToGnosis", [], [_arg("", "address")]),
 ]
 
 WETH_ABI = [

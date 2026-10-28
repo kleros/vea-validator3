@@ -70,3 +70,21 @@ def test_reopen_persists(tmp_path):
     store.close()
     store2 = Store(path)
     assert store2.get_claim(5).epoch == 5
+
+
+def test_alerts_once_survive_reopen_and_clear_by_prefix(tmp_path):
+    store = Store(tmp_path / "t.db")
+    assert store.alert_sent("deadline:7:4h") is None
+    store.mark_alert("deadline:7:4h", ts=100)
+    store.mark_alert("deadline:7:1h", ts=200)
+    store.mark_alert("shutdown:50", ts=300)
+    store.close()
+
+    store = Store(tmp_path / "t.db")
+    assert store.alert_sent("deadline:7:4h") == 100
+    store.mark_alert("deadline:7:4h", ts=150)
+    assert store.alert_sent("deadline:7:4h") == 150
+    store.clear_alerts("deadline:7:")
+    assert store.alert_sent("deadline:7:4h") is None
+    assert store.alert_sent("deadline:7:1h") is None
+    assert store.alert_sent("shutdown:50") == 300

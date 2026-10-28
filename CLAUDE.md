@@ -91,16 +91,49 @@ to one of `tick()`/`run_loop()` or the one-shot handlers.
 ### Claim state machine (SQLite `claims.status`, defined in `store.py`)
 
 ```
-SEEN → HONEST                       (root matches; terminal)
-SEEN → UNDECIDED                    (waiting for L2 finality past epoch end)
-SEEN/UNDECIDED → CHALLENGE_PENDING  (mismatch; tx being sent)
-CHALLENGE_PENDING → CHALLENGED      (our tx or someone else's Challenged event)
+SEEN → HONEST                       (our evaluate() ruled the root matches on a complete leg; terminal)
+SEEN → UNDECIDED                    (waiting for L2 finality / quorum; reason in row.note)
+SEEN/UNDECIDED → CHALLENGE_PENDING  (mismatch with >= min_challenge_agreement agreeing reads; tx being sent)
+SEEN/UNDECIDED → VERIFIED_UNDECIDED (verified honest == Claimer before we decided, or withdrawn before processing; terminal, CRITICAL)
+SEEN/UNDECIDED (fraud: note) → MISSED (verified before our challenge landed; CRITICAL)
+CHALLENGE_PENDING → CHALLENGED      (our tx's Challenged event)
+CHALLENGE_PENDING → CHALLENGED_BY_OTHER (someone else's Challenged event; still reconciled every tick)
+CHALLENGE_PENDING → MISSED          (verified honest == Claimer, challenger not ours, or hash deleted; CRITICAL)
+CHALLENGED/SNAPSHOT_SENT/L1_EXECUTED → CHALLENGE_PENDING (our challenge reorged out: confirmed-height hash back to challenger == 0, honest == None, no successful receipt for challenge_tx; CRITICAL, re-challenge)
+CHALLENGED/CHALLENGED_BY_OTHER/SNAPSHOT_SENT/L1_EXECUTED → WITHDRAWN (escape hatch: bridge shut down, challenger zeroed; WARNING)
+CHALLENGED_BY_OTHER → UNDECIDED     (their challenge reorged out; re-evaluated, WARNING)
+CHALLENGED_BY_OTHER → MISSED        (verified honest == Challenger, or claim hash deleted/withdrawn)
+CHALLENGED_BY_OTHER → HONEST        (verified honest == Claimer and our evaluate() had stored true_root == claimed root)
+CHALLENGED_BY_OTHER → VERIFIED_UNDECIDED (verified honest == Claimer otherwise; CRITICAL)
 CHALLENGED → SNAPSHOT_SENT          (sendSnapshot confirmed on L2)
 SNAPSHOT_SENT → L1_EXECUTED         (outbox executeTransaction confirmed; ArbToGnosis: router routed)
 L1_EXECUTED → RESOLVED              (Verified event, honest == Challenger)
 RESOLVED → WITHDRAWN                (withdrawChallengeDeposit confirmed; terminal)
 any → MISSED / LOST / DESYNC        (verified before we acted / claimer ruled honest / hash unreconstructable)
 ```
+
+`HONEST` is only for rows our `evaluate()` ruled honest, from a leg that every configured RPC answered;
+an undecided row verified for the claimer is `VERIFIED_UNDECIDED` (CRITICAL), or `MISSED` when its
+note starts `fraud:`. `CHALLENGED_BY_OTHER` is reconciled every tick. `reconcile` reads `claimHashes`
+at the event-scan cursor (`_apply_verified` at the `Verified` event's block), only while that block is
+within 64 blocks of `confirmed_head()`; otherwise it takes no DESYNC or revert transition and
+`_apply_verified` reads at `latest`. A revert (confirmed-height hash with `challenger == 0`,
+`honest == None`) sends our states back to `CHALLENGE_PENDING` unless a successful receipt for our
+`challenge_tx` holds it (`reorg-stuck:<E>` pages after 10 minutes), and `CHALLENGED_BY_OTHER` back
+to `UNDECIDED` (WARNING); after a bridge shutdown it is the escape hatch instead (`WITHDRAWN`).
+
+Each tick also alerts (once per key, kept in SQLite): 4 h / 1 h before an undecided or challenge-pending non-devnet claim
+can be verified (opt-in `challenge_on_ambiguity` override at 15 min); the bridge-shutdown countdown at
+50/75/90 % of `timeoutEpochs`; and a no-claim alarm after `liveness_epochs`. `CHALLENGE` needs
+`min_challenge_agreement` agreeing inbox reads, all read at one pinned block (lowest tag block among
+providers; `latest` leg at `latest - confirmations`). A row that raises is isolated (CRITICAL once per
+epoch per hour). `sync_events` is guarded: a failing scan pages `sync-failed` hourly and the tick
+still runs. The fraud, watch-only, override-challenge, dry-run, unfunded and challenge-failed pages are hourly per
+epoch. WAIT reasons: `quorum split on`, `insufficient agreement`, `incomplete:`, `override declined:`.
+RPC endpoints are labelled `<chain>#<i> (<host>)` and URLs are redacted from logs and
+alerts. SIGTERM (handler installed for `run` only) stops the loop between ticks/rows, closes the
+store and exits 0; `run` publishes provider stats to `<db path>.providers.json` for `status`. Details in
+[docs/design.md](docs/design.md).
 
 ### Routes
 
@@ -113,7 +146,8 @@ let the operator verify instantly, so devnet challenges are treated as best-effo
 
 ### Loop cadence
 
-`run_loop` → `startup_checks` (chain-id match, genuine `finalized` support, local `hash_claim` parity
+`run_loop` → `startup_checks` (chain-id match incl. L1, inbox/outbox/router pairing and equal
+`epochPeriod`, genuine `finalized` support, local `hash_claim` parity
 against a live contract read, funding) then `tick()` every `poll_interval` (default 30s): sync events
 → reconcile/evaluate active claims → act on verdicts → advance resolution → handle bridge shutdown.
 Every action re-validates on-chain state immediately before sending.

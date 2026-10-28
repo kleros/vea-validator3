@@ -16,7 +16,9 @@ anything but a plain EOA.
 from __future__ import annotations
 
 import logging
+import time
 
+from .chain import redact
 from .claims import ZERO_ADDRESS, Party
 from .contracts import OutboxContract, OutboxParams, WethToken
 from .notify import CRITICAL, INFO, Notifier
@@ -51,6 +53,15 @@ class Challenger:
         self.gas_reserve_wei = gas_reserve_wei
         self.devnet = devnet
         self.dry_run = dry_run
+
+    def _page_hourly(self, key: str, message: str) -> None:
+        """CRITICAL at most once per hour per key: the row is retried every tick."""
+        now = int(time.time())
+        sent = self.store.alert_sent(key)
+        if sent is not None and now - sent < 3600:
+            return
+        self.store.mark_alert(key, now)
+        self.notifier.send(CRITICAL, message)
 
     # -- funding ----------------------------------------------------------------
 
@@ -99,8 +110,15 @@ class Challenger:
         return 1.0
 
     def _stuck_challenge_nonce(self, epoch: int) -> int | None:
-        """Nonce of an in-flight (broadcast, unmined) challenge to replace."""
+        """Lowest unmined nonce of an earlier challenge attempt, to replace.
+
+        An INTENT row with no tx hash counts too: its broadcast may have reached
+        a node before failing. Rows whose nonce is still pending stay open until
+        the challenge confirms or the nonce is consumed, so an attempt that fails
+        before its own intent is journaled (simulation, fee quote) cannot lose it.
+        """
         replace: int | None = None
+        confirmed: int | None = None
         for intent in self.store.open_intents("challenge"):
             if intent["epoch"] != epoch or intent["sender"] != self.sender.address:
                 continue
@@ -109,14 +127,26 @@ class Challenger:
                 # will surface the outcome. Nothing to replace.
                 self.store.journal_final(intent["id"], "MINED")
                 continue
-            self.store.journal_final(intent["id"], "SUPERSEDED")
-            if intent["tx_hash"] and intent["nonce"] is not None:
+            if intent["nonce"] is None:
+                self.store.journal_final(intent["id"], "SUPERSEDED")
+                continue
+            if confirmed is None:
                 confirmed = self.sender.client.with_failover(
                     lambda w3: w3.eth.get_transaction_count(self.sender.address)
                 )
-                if intent["nonce"] >= confirmed:
-                    replace = int(intent["nonce"])
+            if intent["nonce"] < confirmed:
+                # The nonce was used by another tx (a replacement that mined).
+                self.store.journal_final(intent["id"], "SUPERSEDED")
+                continue
+            nonce = int(intent["nonce"])
+            replace = nonce if replace is None else min(replace, nonce)
         return replace
+
+    def _close_open_intents(self, epoch: int) -> None:
+        """The challenge confirmed: earlier attempts for the epoch were replaced."""
+        for intent in self.store.open_intents("challenge"):
+            if intent["epoch"] == epoch and intent["sender"] == self.sender.address:
+                self.store.journal_final(intent["id"], "SUPERSEDED")
 
     def challenge(self, row: ClaimRow) -> bool:
         """Attempt to challenge; returns True when the challenge confirmed."""
@@ -131,16 +161,16 @@ class Challenger:
             return False
 
         if self.dry_run:
-            self.notifier.send(
-                CRITICAL,
+            self._page_hourly(
+                f"dry-run:{epoch}",
                 f"DRY-RUN: would challenge epoch {epoch} "
                 f"(claimed 0x{row.claim.state_root.hex()}, true {row.true_root})",
             )
             return False
 
         if not self.can_fund_challenge():
-            self.notifier.send(
-                CRITICAL,
+            self._page_hourly(
+                f"unfunded:{epoch}",
                 f"INSUFFICIENT FUNDS to challenge fraudulent claim epoch {epoch} — "
                 f"an unchallenged fraud WILL verify. Fund {self.sender.address} now.",
             )
@@ -177,14 +207,21 @@ class Challenger:
             # Someone may have front-run us, or the struct changed, or the RPC
             # dropped the tx. The row stays CHALLENGE_PENDING and the watcher
             # RETRIES it every tick until Challenged appears or the state moves.
-            log.warning("challenge tx failed for epoch %s: %s", epoch, exc)
+            log.warning("challenge tx failed for epoch %s: %s", epoch, redact(str(exc)))
             row.status = CHALLENGE_PENDING
-            row.note = f"challenge attempt failed: {exc}"
+            row.note = f"challenge attempt failed: {redact(str(exc))}"
             self.store.upsert_claim(row)
+            self._page_hourly(
+                f"challenge-failed:{epoch}",
+                f"CHALLENGE FAILED for fraudulent claim epoch {epoch} (retrying every "
+                f"tick): {redact(str(exc))}",
+            )
             return False
 
+        self._close_open_intents(epoch)
         row.challenge_tx = receipt["transactionHash"].to_0x_hex()
         row.status = CHALLENGED
+        row.note = f"challenged (tx {row.challenge_tx})"
         # The contract sets challenger to msg.sender (we use the 2-arg overload).
         row.claim = row.claim.__class__(
             state_root=row.claim.state_root,
