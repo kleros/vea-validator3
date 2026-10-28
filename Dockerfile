@@ -4,7 +4,7 @@
 
 # Base images pinned by digest: a tag can be moved to other content, a digest
 # cannot. Bump tag and digest together (Dependabot's docker ecosystem does both).
-FROM ghcr.io/astral-sh/uv:0.11.27@sha256:4d01caf3b22dfd11003455e2e68153da08c4ee1fa54fdbd166c6282d22693419 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 AS uv
 
 # Python version for vea-challenger (matches .python-version)
 FROM python:3.12.15-alpine3.24@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4 AS builder
