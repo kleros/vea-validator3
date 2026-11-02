@@ -7,7 +7,7 @@
 FROM ghcr.io/astral-sh/uv:0.11.27@sha256:4d01caf3b22dfd11003455e2e68153da08c4ee1fa54fdbd166c6282d22693419 AS uv
 
 # Python version for vea-challenger (matches .python-version)
-FROM python:3.12.15-alpine3.24@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4 AS builder
+FROM python:3.15.0-alpine3.24@sha256:2699b90f4d562a22e2dd076c82f964032f64814204bff36d271a54ba4cc2c7e2 AS builder
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
@@ -42,7 +42,7 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 #
 # This is the final layer that will be deployed and run
 
-FROM python:3.12.15-alpine3.24@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4 AS vea-challenger
+FROM python:3.15.0-alpine3.24@sha256:2699b90f4d562a22e2dd076c82f964032f64814204bff36d271a54ba4cc2c7e2 AS vea-challenger
 
 # Fixed uid/gid (not -S/system range) so a host-side `chown 1000:1000` on a
 # bind-mounted ./data works the same on every host.
